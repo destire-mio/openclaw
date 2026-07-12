@@ -1,5 +1,5 @@
-import type { AssistantMessage } from "../types.js";
 import { extractLeadingHttpStatus } from "../../shared/assistant-error-format.js";
+import type { AssistantMessage } from "../types.js";
 
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
   return new RegExp(patterns.join("|"), "i");
