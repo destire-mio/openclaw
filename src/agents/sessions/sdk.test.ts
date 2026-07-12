@@ -3,7 +3,7 @@ import { createAssistantMessageEventStream, type AssistantMessage } from "opencl
 // session write-lock behavior.
 import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Context, Model, SimpleStreamOptions } from "../../llm/types.js";
+import type { Model, SimpleStreamOptions } from "../../llm/types.js";
 import {
   createUserTurnTranscriptRecorder,
   takeRuntimeUserTurnTranscriptContext,
@@ -75,7 +75,11 @@ function createAssistantError(errorMessage: string): AssistantMessage {
 function createAssistantResultStream(message: AssistantMessage) {
   const stream = createAssistantMessageEventStream();
   queueMicrotask(() => {
-    stream.push({ type: "done", reason: message.stopReason, message });
+    if (message.stopReason === "error" || message.stopReason === "aborted") {
+      stream.push({ type: "error", reason: message.stopReason, error: message });
+    } else {
+      stream.push({ type: "done", reason: message.stopReason, message });
+    }
     stream.end();
   });
   return stream;
