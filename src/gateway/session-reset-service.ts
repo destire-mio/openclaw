@@ -15,7 +15,6 @@ import { getAcpRuntimeBackend } from "../acp/runtime/registry.js";
 import { buildAcpDatabaseSessionKey } from "../acp/runtime/session-meta-keys.js";
 import { writeAcpSessionMetaForMigration } from "../acp/runtime/session-meta.js";
 import {
-  listAgentIds,
   resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveAmbientOwnerAgentId,
@@ -48,7 +47,6 @@ import {
   SESSION_TOTAL_TOKENS_VERSION,
   type InternalSessionEntry,
   type SessionEntry,
-  deleteSessionEntryLifecycle,
   resetSessionEntryLifecycle,
 } from "../config/sessions.js";
 import { rebindCliSessionReseedReceiptsForReset } from "../config/sessions/cli-session-binding.js";
@@ -82,7 +80,6 @@ import {
   isIncognitoSessionKey,
   isSubagentSessionKey,
   normalizeAgentId,
-  parseAgentSessionKey,
 } from "../routing/session-key.js";
 import { resolveMissingAgentHarnessSessionError } from "../sessions/agent-harness-session-key.js";
 import {
@@ -116,22 +113,21 @@ import {
   settleGatewaySessionLifecycleCommit,
 } from "./session-lifecycle-preparation.js";
 import { resolvePluginSessionOwnershipError } from "./session-plugin-ownership.js";
+import { invalidSessionRequest } from "./session-request-error.js";
 import {
   buildPendingAcpMeta,
   closeAcpRuntimeForSession,
   closeChildAcpRuntimesForParent,
 } from "./session-reset-acp.js";
+import { deleteIncognitoSessionForReset } from "./session-reset-incognito.js";
 import { notifyGatewaySessionReset } from "./session-reset-notifications.js";
+import { resolveSessionResetTarget } from "./session-reset-target.js";
 import { readGatewayBeforeResetPluginHookMessages } from "./session-reset-transcript.js";
 import {
   resolveStableSessionEndTranscript,
   type ArchivedSessionTranscript,
 } from "./session-transcript-files.fs.js";
-import {
-  loadSessionEntry,
-  resolveGatewaySessionStoreTarget,
-  resolveSessionStoreKey,
-} from "./session-utils.js";
+import { loadSessionEntry, resolveGatewaySessionStoreTarget } from "./session-utils.js";
 import type { SessionWorkerPlacementContext } from "./session-worker-placement-context.js";
 import {
   resolveSessionWorkerPlacementMutationError,
@@ -712,40 +708,7 @@ export async function performGatewaySessionReset(params: {
     }
   | { ok: false; error: ReturnType<typeof errorShape> }
 > {
-  const resetTarget = (() => {
-    const cfg = getRuntimeConfig();
-    const explicitAgentId = params.agentId ? normalizeAgentId(params.agentId) : undefined;
-    const parsedKey = parseAgentSessionKey(params.key);
-    const inferredGlobalAgentId =
-      !explicitAgentId &&
-      parsedKey &&
-      resolveSessionStoreKey({ cfg, sessionKey: params.key }) === "global"
-        ? normalizeAgentId(parsedKey.agentId)
-        : undefined;
-    const requestedAgentId = explicitAgentId ?? inferredGlobalAgentId;
-    if (requestedAgentId && !listAgentIds(cfg).includes(requestedAgentId)) {
-      return {
-        ok: false as const,
-        error: errorShape(ErrorCodes.INVALID_REQUEST, `Unknown agent id: ${requestedAgentId}`),
-      };
-    }
-    if (
-      explicitAgentId &&
-      parsedKey?.agentId &&
-      normalizeAgentId(parsedKey.agentId) !== explicitAgentId
-    ) {
-      return {
-        ok: false as const,
-        error: errorShape(ErrorCodes.INVALID_REQUEST, "session key agent does not match agentId"),
-      };
-    }
-    const target = resolveGatewaySessionStoreTarget({
-      cfg,
-      key: params.key,
-      ...(requestedAgentId ? { agentId: requestedAgentId } : {}),
-    });
-    return { ok: true as const, cfg, target, storePath: target.storePath, requestedAgentId };
-  })();
+  const resetTarget = resolveSessionResetTarget(getRuntimeConfig(), params);
   if (!resetTarget.ok) {
     return resetTarget;
   }
@@ -810,18 +773,12 @@ export async function performGatewaySessionReset(params: {
     initialResetEntry,
   );
   if (missingHarnessSessionError) {
-    return {
-      ok: false,
-      error: errorShape(ErrorCodes.INVALID_REQUEST, missingHarnessSessionError),
-    };
+    return invalidSessionRequest(missingHarnessSessionError);
   }
   // Reject before interrupting admitted work or firing reset hooks. The model lock is
   // session-id scoped, so rotating first would silently detach native harness ownership.
   if (isModelSelectionLocked(initialResetEntry)) {
-    return {
-      ok: false,
-      error: errorShape(ErrorCodes.INVALID_REQUEST, MODEL_SELECTION_LOCKED_RESET_MESSAGE),
-    };
+    return invalidSessionRequest(MODEL_SELECTION_LOCKED_RESET_MESSAGE);
   }
   const workerPlacementContext =
     params.workerPlacementContext ??
@@ -860,10 +817,7 @@ export async function performGatewaySessionReset(params: {
     sessionId: normalizeOptionalString(initialResetEntry?.sessionId),
   });
   if (initialPlacementError) {
-    return {
-      ok: false,
-      error: errorShape(ErrorCodes.INVALID_REQUEST, initialPlacementError.message),
-    };
+    return invalidSessionRequest(initialPlacementError.message);
   }
   const resetLifecycleIdentities = [
     resetTarget.target.canonicalKey,
@@ -1027,10 +981,7 @@ export async function performGatewaySessionReset(params: {
         sessionId: normalizeOptionalString(entry?.sessionId),
       });
       if (placementRetirementError) {
-        return {
-          ok: false,
-          error: errorShape(ErrorCodes.INVALID_REQUEST, placementRetirementError.message),
-        };
+        return invalidSessionRequest(placementRetirementError.message);
       }
       if (entry?.worktree?.id) {
         const record = managedWorktrees.findLiveById(entry.worktree.id);
@@ -1149,7 +1100,7 @@ export async function performGatewaySessionReset(params: {
 
       const { prepareSubagentSessionCleanupRevocation } =
         await import("../agents/subagents/registry/subagent-registry.js");
-      const revokeSessionCleanup = prepareSubagentSessionCleanupRevocation(target.canonicalKey);
+      const revokeCleanup = await prepareSubagentSessionCleanupRevocation(target.canonicalKey);
       const commitGuard = () => {
         assertCompletionAuthorized?.();
         const current = loadSessionEntryReadOnly({
@@ -1164,49 +1115,34 @@ export async function performGatewaySessionReset(params: {
         ) {
           // Revoke durably before publishing the successor. A later reset failure may
           // retain the old session, but must never restore its stale deletion authority.
-          revokeSessionCleanup();
+          revokeCleanup();
         }
       };
 
       if (incognito) {
         if (!entry) {
-          return {
-            ok: false,
-            error: errorShape(ErrorCodes.INVALID_REQUEST, `unknown session: ${params.key}`),
-          };
+          return invalidSessionRequest(`unknown session: ${params.key}`);
         }
-        await emitGatewayBeforeResetPluginHook({
-          cfg,
+        const deleted = await deleteIncognitoSessionForReset({
           key: params.key,
-          messages: beforeResetMessages,
+          agentId,
+          storePath,
           target,
-          storePath,
           entry,
-          reason: params.reason,
-        });
-        const deleted = await deleteSessionEntryLifecycle({
           commitGuard,
-          agentId: target.agentId,
-          archiveTranscript: false,
-          deleteDeliveryArtifacts: true,
-          deleteTranscriptWithoutArchive: true,
-          expectedEntry: entry,
-          expectedSessionId: entry.sessionId,
-          expectedUpdatedAt: entry.updatedAt,
-          storePath,
-          target: {
-            canonicalKey: target.canonicalKey,
-            storeKeys: target.storeKeys,
-          },
+          beforeDelete: () =>
+            emitGatewayBeforeResetPluginHook({
+              cfg,
+              key: params.key,
+              messages: beforeResetMessages,
+              target,
+              storePath,
+              entry,
+              reason: params.reason,
+            }),
         });
-        if (!deleted.deleted) {
-          return {
-            ok: false,
-            error: errorShape(
-              ErrorCodes.UNAVAILABLE,
-              `Session ${params.key} changed before reset. Retry.`,
-            ),
-          };
+        if (!deleted.ok) {
+          return deleted;
         }
         handleSessionStateSessionDeleted(target.canonicalKey, agentId);
         notifyGatewaySessionReset(target.canonicalKey, target.agentId);
@@ -1230,7 +1166,7 @@ export async function performGatewaySessionReset(params: {
           agentId: target.agentId,
           storePath,
           incognitoDeleted: true,
-          deletedSessionId: deleted.deletedSessionId,
+          deletedSessionId: deleted.value.deletedSessionId,
         };
       }
 

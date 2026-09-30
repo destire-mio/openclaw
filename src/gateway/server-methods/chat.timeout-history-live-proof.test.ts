@@ -18,12 +18,11 @@ import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers
 import { buildMockOpenAiResponsesProvider } from "../test-openai-responses-model.js";
 
 // Observe the existing owner boundary without replacing its implementation.
-// Drive the owner's minute callbacks together, as one real timer tick would.
-// Health and cold-storage timers share the deadline sweep's interval.
+// Drive the registered deadline sweep directly; unrelated periodic jobs stay idle.
 // RPC admission, expiry, abort, persistence, and model HTTP requests run normally.
 const maintenance = vi.hoisted(() => ({
   params: undefined as Parameters<typeof startGatewayMaintenanceTimers>[0] | undefined,
-  sweep: undefined as (() => void) | undefined,
+  sweep: undefined as (() => void | Promise<unknown>) | undefined,
 }));
 vi.mock("../server-maintenance.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../server-maintenance.js")>();
@@ -31,26 +30,18 @@ vi.mock("../server-maintenance.js", async (importOriginal) => {
     ...actual,
     startGatewayMaintenanceTimers: (...args: Parameters<typeof startGatewayMaintenanceTimers>) => {
       maintenance.params = args[0];
-      const realSetInterval = globalThis.setInterval;
-      const minuteCallbacks: Array<() => void> = [];
-      const timer = vi
-        .spyOn(globalThis, "setInterval")
-        .mockImplementation((callback, delay, ...rest) => {
-          if (delay === 60_000) {
-            minuteCallbacks.push(() => callback(...rest));
-          }
-          return realSetInterval(callback, delay, ...rest);
-        });
+      const scheduler = args[0].scheduler;
+      const schedule = scheduler.schedule.bind(scheduler);
+      const scheduling = vi.spyOn(scheduler, "schedule").mockImplementation((job) => {
+        if (job.id === "maintenance:dedupe") {
+          maintenance.sweep = job.run;
+        }
+        return schedule(job);
+      });
       try {
-        const timers = actual.startGatewayMaintenanceTimers(...args);
-        maintenance.sweep = () => {
-          for (const callback of minuteCallbacks) {
-            callback();
-          }
-        };
-        return timers;
+        return actual.startGatewayMaintenanceTimers(...args);
       } finally {
-        timer.mockRestore();
+        scheduling.mockRestore();
       }
     },
   };
@@ -363,7 +354,7 @@ describe("deadline outcome real Gateway history proof", () => {
             if (!maintenance.sweep) {
               throw new Error("Gateway maintenance sweep was not installed");
             }
-            maintenance.sweep();
+            void maintenance.sweep();
             expect(entry.controller.signal.aborted).toBe(true);
             expect(entry.abortStopReason).toBe("timeout");
             // Deadline emission installs the owner in this same synchronous

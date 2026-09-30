@@ -1,5 +1,5 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { assert, describe, expect, it, vi } from "vitest";
+import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { prepareSystemAgentRunAdmission } from "../agents/admitted-run-context.js";
 import {
@@ -28,6 +28,7 @@ import {
   drainAgentRunTerminalWrites,
 } from "../infra/agent-run-terminal-writes.js";
 import { recordGatewaySessionRunFailure } from "../sessions/session-run-error.js";
+import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { abortChatRunById, registerChatAbortController, type ChatAbortOps } from "./chat-abort.js";
 import { createChatRunState } from "./server-chat-state.js";
@@ -237,7 +238,7 @@ describe("durable pre-reply run failure", () => {
         {
           type: "custom_message",
           customType: "run-failed-before-reply",
-          content: `This turn ended before a reply: ${error}`,
+          content: `Your request couldn't be completed: ${error}`,
           display: true,
           details: { runId, error },
         },
@@ -269,7 +270,7 @@ describe("durable pre-reply run failure", () => {
       const [report] = await reports();
       expect(report).toMatchObject({
         content: expect.stringMatching(
-          /^This turn ended before a reply: ⚠️ Authentication failed \(provider returned HTTP 401\)/,
+          /^Your request couldn't be completed: ⚠️ Authentication failed \(provider returned HTTP 401\)/,
         ),
         details: { runId, error: expect.stringMatching(/^⚠️ Authentication failed/) },
       });
@@ -591,7 +592,9 @@ async function createCliHistoryFixture() {
       timestamp: 1_000,
     });
   });
-  const owner = createSessionLifecyclePersistenceOwner();
+  const scheduler = createTestGatewayScheduler();
+  onTestFinished(() => scheduler.stop());
+  const owner = createSessionLifecyclePersistenceOwner(scheduler);
   const captured = captureAgentRunTerminalWriteContext(cliRunId);
   if (!captured) {
     throw new Error("Expected the admitted runtime's terminal write context");
