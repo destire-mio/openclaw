@@ -266,9 +266,10 @@ it.for(admissionScenarios)(
         }
         void handling.catch(() => {});
         if (foreignGlobalTimeout) {
-          // The foreign promise remains unresolved throughout this bounded check.
-          // Without agent matching, real admission blocks and dispatch never starts.
-          await vi.waitFor(() => expect(holdDispatch).toHaveBeenCalledOnce(), { timeout: 3_000 });
+          // Keep the foreign promise held until actual admission finishes. A wrong
+          // agent match cannot finish handling and fails at the owning test deadline.
+          await withinTest(handling, signal);
+          expect(holdDispatch).toHaveBeenCalledOnce();
         }
         if (timeoutDuringAdmission) {
           await withinTest(

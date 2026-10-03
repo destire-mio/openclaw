@@ -16,6 +16,7 @@ import { emitAgentEvent, onAgentEvent, type AgentEventPayload } from "../../infr
 import { closeOpenClawAgentDatabasesForTest } from "../../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../../state/openclaw-state-db.js";
 import { captureEnv, setTestEnvValue } from "../../test-utils/env.js";
+import { waitForChatAbortControllerRemoval } from "../chat-abort-lifecycle-internal.js";
 import type { startGatewayMaintenanceTimers } from "../server-maintenance.js";
 import { loadSessionEntry } from "../session-utils.js";
 import { disconnectGatewayClient, startGatewayWithClient } from "../test-helpers.e2e.js";
@@ -27,6 +28,7 @@ import { buildMockOpenAiResponsesProvider } from "../test-openai-responses-model
 const maintenance = vi.hoisted(() => ({
   params: undefined as Parameters<typeof startGatewayMaintenanceTimers>[0] | undefined,
   sweep: undefined as (() => void | Promise<unknown>) | undefined,
+  onStarted: undefined as (() => void) | undefined,
 }));
 vi.mock("../server-maintenance.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../server-maintenance.js")>();
@@ -51,7 +53,9 @@ vi.mock("../server-maintenance.js", async (importOriginal) => {
         return scope;
       });
       try {
-        return actual.startGatewayMaintenanceTimers(...args);
+        const result = actual.startGatewayMaintenanceTimers(...args);
+        maintenance.onStarted?.();
+        return result;
       } finally {
         scoping.mockRestore();
         for (const scheduling of schedulingSpies) {
@@ -159,6 +163,45 @@ describe("deadline outcome real Gateway history proof", () => {
       let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
       const requests: CapturedRequest[] = [];
       const lifecycle: AgentEventPayload[] = [];
+      const requestWaiters = new Map<number, (request: CapturedRequest) => void>();
+      const timedOutRuns = new Set<string>();
+      const timeoutWaiters = new Map<string, () => void>();
+      const maintenanceStarted = createDeferred();
+      const partialVisible = createDeferred();
+      maintenance.onStarted = () => maintenanceStarted.resolve();
+      const waitForProviderRequest = (index: number): Promise<CapturedRequest> => {
+        const received = requests[index];
+        if (received) {
+          return Promise.resolve(received);
+        }
+        const pending = createDeferred<CapturedRequest>();
+        requestWaiters.set(index, pending.resolve);
+        return withinTest(pending.promise, signal);
+      };
+      const waitForTimeout = (runId: string): Promise<void> => {
+        if (timedOutRuns.has(runId)) {
+          return Promise.resolve();
+        }
+        const pending = createDeferred();
+        timeoutWaiters.set(runId, pending.resolve);
+        return withinTest(pending.promise, signal);
+      };
+      const waitForRunRemoval = async (runId: string) => {
+        const entries = maintenance.params?.chatAbortControllers;
+        if (!entries) {
+          throw new Error("Gateway maintenance has not started");
+        }
+        const entry = entries.get(runId);
+        if (entry) {
+          await waitForChatAbortControllerRemoval({
+            entries,
+            targets: [{ runId, entry }],
+            timeoutMs: null,
+            signal,
+          });
+        }
+        expect(entries.has(runId)).toBe(false);
+      };
       const chatEvents: Array<Record<string, unknown>> = [];
       let scenario: Scenario = "empty-timeout";
       let nextTurn = false;
@@ -166,6 +209,11 @@ describe("deadline outcome real Gateway history proof", () => {
       const unsubscribe = onAgentEvent((event) => {
         if (event.stream === "lifecycle") {
           lifecycle.push(event);
+          if (event.data.stopReason === "timeout" && event.data.aborted === true) {
+            timedOutRuns.add(event.runId);
+            timeoutWaiters.get(event.runId)?.();
+            timeoutWaiters.delete(event.runId);
+          }
         }
       });
       try {
@@ -219,7 +267,11 @@ describe("deadline outcome real Gateway history proof", () => {
               string,
               unknown
             >;
-            requests.push({ body, response });
+            const index = requests.length;
+            const captured = { body, response };
+            requests.push(captured);
+            requestWaiters.get(index)?.(captured);
+            requestWaiters.delete(index);
             if (nextTurn || scenario === "normal") {
               writeOpenAiResponsesText(response, {
                 text: COMPLETE,
@@ -300,11 +352,19 @@ describe("deadline outcome real Gateway history proof", () => {
           },
           onEvent: (event) => {
             if (event.event === "chat" && event.payload && typeof event.payload === "object") {
-              chatEvents.push(event.payload as Record<string, unknown>);
+              const payload = event.payload as Record<string, unknown>;
+              chatEvents.push(payload);
+              if (
+                payload.runId === "timeout-proof-partial-timeout" &&
+                JSON.stringify(payload).includes(PARTIAL)
+              ) {
+                partialVisible.resolve();
+              }
             }
           },
         });
-        await expect.poll(() => maintenance.params, { timeout: 20_000 }).toBeDefined();
+        await withinTest(maintenanceStarted.promise, signal);
+        expect(maintenance.params).toBeDefined();
         const verdicts: unknown[] = [];
         for (const current of [
           "empty-timeout",
@@ -344,9 +404,7 @@ describe("deadline outcome real Gateway history proof", () => {
             },
           );
           expect(started.status).toBe("started");
-          await expect
-            .poll(() => requests.length, { timeout: 20_000 })
-            .toBeGreaterThan(requestStart);
+          await waitForProviderRequest(requestStart);
           const isTimeout = current.endsWith("timeout");
           let earlyContinued: Promise<{ runId: string }> | undefined;
           let earlyNextRequestStart: number | undefined;
@@ -354,11 +412,10 @@ describe("deadline outcome real Gateway history proof", () => {
           let reportGateReached: boolean | undefined;
           let terminalPersistence: Promise<void> | undefined;
           if (current === "partial-timeout") {
-            await expect
-              .poll(() => maintenance.params?.chatRunState.runs.get(started.runId)?.buffer, {
-                timeout: 10_000,
-              })
-              .toContain(PARTIAL);
+            await withinTest(partialVisible.promise, signal);
+            expect(maintenance.params?.chatRunState.runs.get(started.runId)?.buffer).toContain(
+              PARTIAL,
+            );
           }
           if (isTimeout) {
             const entry = maintenance.params?.chatAbortControllers.get(started.runId);
@@ -377,18 +434,7 @@ describe("deadline outcome real Gateway history proof", () => {
             // stack, before any next RPC or microtask can read the transcript.
             expect(entry.projectSessionTerminalPersistence).toBeInstanceOf(Promise);
             terminalPersistence = entry.projectSessionTerminalPersistence;
-            await expect
-              .poll(
-                () =>
-                  lifecycle.some(
-                    (event) =>
-                      event.runId === started.runId &&
-                      event.data.stopReason === "timeout" &&
-                      event.data.aborted === true,
-                  ),
-                { timeout: 10_000 },
-              )
-              .toBe(true);
+            await waitForTimeout(started.runId);
           } else if (current === "user-cancel") {
             const aborted = await gateway.client.request<{ aborted: boolean }>("chat.abort", {
               sessionKey,
@@ -464,16 +510,7 @@ describe("deadline outcome real Gateway history proof", () => {
               releaseReport.resolve();
             }
           }
-          await expect
-            .poll(() => maintenance.params?.chatAbortControllers.has(started.runId), {
-              timeout: 20_000,
-            })
-            .toBe(false);
-          await gateway.client.request(
-            "agent.wait",
-            { runId: started.runId, timeoutMs: 20_000 },
-            { timeoutMs: 25_000 },
-          );
+          await waitForRunRemoval(started.runId);
           if (current === "duplicate-timeout") {
             const terminal = lifecycle.find(
               (event) =>
@@ -548,9 +585,7 @@ describe("deadline outcome real Gateway history proof", () => {
               deliver: false,
               idempotencyKey: `timeout-proof-next-${current}`,
             }));
-          await expect
-            .poll(() => requests.length, { timeout: 20_000 })
-            .toBeGreaterThan(nextRequestStart);
+          await waitForProviderRequest(nextRequestStart);
           const modelInput = JSON.stringify(requests[nextRequestStart]?.body);
           console.info(
             `TIMEOUT_HISTORY_CASE ${JSON.stringify({ scenario: current, acceleration: isTimeout ? "registered expiresAtMs set to past; real maintenance callback invoked" : "none", transcript: firstTranscript, history: firstHistory, nextProviderRequest: requests[nextRequestStart]?.body })}`,
@@ -569,11 +604,7 @@ describe("deadline outcome real Gateway history proof", () => {
           if (current === "normal") {
             expect.soft(modelInput.includes(COMPLETE)).toBe(true);
           }
-          await gateway.client.request(
-            "agent.wait",
-            { runId: continued.runId, timeoutMs: 20_000 },
-            { timeoutMs: 25_000 },
-          );
+          await waitForRunRemoval(continued.runId);
           expect.soft(reportRows(await transcriptFor(sessionKey))).toHaveLength(isTimeout ? 1 : 0);
           verdicts.push({
             scenario: current,
@@ -624,6 +655,9 @@ describe("deadline outcome real Gateway history proof", () => {
         }
         maintenance.params = undefined;
         maintenance.sweep = undefined;
+        maintenance.onStarted = undefined;
+        requestWaiters.clear();
+        timeoutWaiters.clear();
         envSnapshot.restore();
         clearRuntimeConfigSnapshot();
         clearConfigCache();
