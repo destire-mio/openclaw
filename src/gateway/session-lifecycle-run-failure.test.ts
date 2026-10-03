@@ -19,7 +19,11 @@ import {
   replaceTranscriptEvents,
   upsertSessionEntryCore,
 } from "../config/sessions/session-accessor.js";
-import { runWithoutOwnedSessionTranscriptWrites } from "../config/sessions/transcript-write-context.js";
+import {
+  runWithoutOwnedSessionTranscriptWrites,
+  SessionTranscriptWriterClaimReboundError,
+  withOwnedSessionTranscriptWrites,
+} from "../config/sessions/transcript-write-context.js";
 import { CURRENT_SESSION_VERSION } from "../config/sessions/version.js";
 import { onAgentEvent, type AgentEventPayload } from "../infra/agent-events.js";
 import {
@@ -27,6 +31,7 @@ import {
   clearAgentRunTerminalWriteContext,
   drainAgentRunTerminalWrites,
 } from "../infra/agent-run-terminal-writes.js";
+import { sessionChanges } from "../sessions/session-row-changes.js";
 import { recordGatewaySessionRunFailure } from "../sessions/session-run-error.js";
 import { createTestGatewayScheduler } from "../test-utils/gateway-scheduler-clock.js";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
@@ -57,6 +62,7 @@ async function seed(assistantBranch?: "active" | "inactive" | "other-run" | "par
     startedAt: 1_000,
     status: "running",
     lifecycleRunId: runId,
+    activeWriterRunId: runId,
     goal: {
       schemaVersion: 1,
       id: "failure-goal",
@@ -223,10 +229,24 @@ describe("durable pre-reply run failure", () => {
     },
   );
 
-  it("records one displayed failure per run and retains it after the next run starts", async () => {
+  it("records one child failure outside its requester's ended turn and retains it after the next run", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       await seed();
-      await persistGatewaySessionLifecycleEvent({ ...target, event });
+      const requester = await resolveSessionTranscriptRuntimeTarget({
+        ...target,
+        sessionKey: "agent:main:requester",
+        sessionId: "requester-session",
+      });
+      await withOwnedSessionTranscriptWrites(
+        {
+          sessionTarget: { ...requester, expectedWriterRunId: "requester-run" },
+          assertCommitAllowed: () => {
+            throw new Error("Requester turn has ended");
+          },
+          withTranscriptWrite: async (write) => await write(),
+        },
+        () => persistGatewaySessionLifecycleEvent({ ...target, event }),
+      );
       const pausedGoal = loadSessionEntry(target)?.goal;
       expect(pausedGoal).toMatchObject({
         id: "failure-goal",
@@ -268,11 +288,11 @@ describe("durable pre-reply run failure", () => {
         event: { ...event, data: { ...event.data, error: providerError } },
       });
       const [report] = await reports();
+      const failureCopy =
+        "⚠️ Couldn't sign in to the AI service. Sign in again under Models in the Control UI or run `openclaw configure`.";
       expect(report).toMatchObject({
-        content: expect.stringMatching(
-          /^Your request couldn't be completed: ⚠️ Authentication failed \(provider returned HTTP 401\)/,
-        ),
-        details: { runId, error: expect.stringMatching(/^⚠️ Authentication failed/) },
+        content: `Your request couldn't be completed: ${failureCopy}`,
+        details: { runId, error: failureCopy },
       });
       expect(JSON.stringify(report)).not.toContain("Missing bearer");
     });
@@ -345,6 +365,63 @@ describe("durable pre-reply run failure", () => {
       });
     },
   );
+
+  it.each([
+    {
+      name: "credential-shaped output",
+      partial: `Unfinished response: api_key=${"sk-" + "synthetic-timeout-credential-".repeat(3)}`,
+    },
+    {
+      name: "a credential crossing the retained-text boundary",
+      partial: `${"x".repeat(7_980)} api_key=${"sk-" + "synthetic-timeout-credential-".repeat(3)}\n${"tail".repeat(3_000)}`,
+    },
+    {
+      name: "UTF-16 output beyond the limit",
+      partial: `${"x".repeat(7_987)}🙂${"tail".repeat(3_000)}`,
+    },
+  ])("redacts and bounds $name before timeout storage and replay", async ({ partial }) => {
+    await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      await seed();
+      await persistGatewaySessionLifecycleEvent({
+        ...target,
+        event: {
+          ...event,
+          data: {
+            phase: "end",
+            aborted: true,
+            stopReason: "timeout",
+            startedAt: 1_000,
+            endedAt: 2_000,
+          },
+        },
+        timeoutPartialText: partial,
+      });
+      const [report] = await reports();
+      assert(isRecord(report) && typeof report.content === "string");
+      const prefix =
+        "This turn timed out and may have performed work before it stopped.\n\nUnfinished assistant output (recorded text, not a completion claim):\n";
+      expect(report.content.startsWith(prefix)).toBe(true);
+      const storedPartial: unknown = JSON.parse(report.content.slice(prefix.length));
+      assert(typeof storedPartial === "string");
+      expect(storedPartial.length).toBeLessThanOrEqual(8_000);
+      expect(storedPartial.isWellFormed()).toBe(true);
+      if (partial.length > 8_000) {
+        expect(storedPartial).toMatch(/\n\[truncated\]$/);
+      }
+      const transcript = JSON.stringify(await loadTranscriptEvents(target));
+      expect(transcript).not.toContain("synthetic-timeout-credential-");
+      const session = await SessionManager.openAsync(
+        await resolveSessionTranscriptRuntimeTarget(target),
+      );
+      const messages = session.buildSessionContext().messages;
+      expect(messages).toEqual(
+        expect.arrayContaining([expect.objectContaining({ content: report.content })]),
+      );
+      const replay = JSON.stringify(messages);
+      expect(replay).not.toContain("synthetic-timeout-credential-");
+      expect(replay).toContain("This turn timed out");
+    });
+  });
 
   it("writes neither timeout notice nor buffered output after queued report authority expires", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
@@ -536,18 +613,57 @@ describe("durable pre-reply run failure", () => {
     });
   });
 
-  it("does not report an error whose lifecycle write was refused", async () => {
+  it.each(["before", "after"])(
+    "rejects authority revoked %s the lifecycle commit",
+    async (when) => {
+      await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        await seed();
+        let current = when === "after";
+        onTestFinished(
+          sessionChanges.subscribe((change) => {
+            if ("sessionKey" in change && change.sessionKey === target.sessionKey) {
+              current = false;
+            }
+          }),
+        );
+        await expect(
+          persistGatewaySessionLifecycleEvent({
+            ...target,
+            event,
+            assertCommitAllowed: () => {
+              if (!current) {
+                throw new Error("Run authority expired");
+              }
+            },
+          }),
+        ).rejects.toThrow("Run authority expired");
+        expect(loadSessionEntry(target)?.status).toBe(when === "after" ? "failed" : "running");
+        expect(await reports()).toEqual([]);
+      });
+    },
+  );
+
+  it("refuses a receipt after another writer claims the accepted terminal's session", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
       await seed();
-      await expect(
-        persistGatewaySessionLifecycleEvent({
-          ...target,
-          event,
-          assertCommitAllowed: () => {
-            throw new Error("Run authority expired");
-          },
-        }),
-      ).rejects.toThrow("Run authority expired");
+      let replacement: Promise<unknown> | undefined;
+      const unsubscribe = sessionChanges.subscribe((change) => {
+        if (!("sessionKey" in change) || change.sessionKey !== target.sessionKey) {
+          return;
+        }
+        unsubscribe();
+        replacement = patchSessionEntryCore(target, () => ({ activeWriterRunId: "successor-run" }));
+      });
+      onTestFinished(unsubscribe);
+      await expect(persistGatewaySessionLifecycleEvent({ ...target, event })).rejects.toThrow(
+        SessionTranscriptWriterClaimReboundError,
+      );
+      await replacement;
+      expect(loadSessionEntry(target)).toMatchObject({
+        status: "failed",
+        lastRunError: error,
+        activeWriterRunId: "successor-run",
+      });
       expect(await reports()).toEqual([]);
     });
   });

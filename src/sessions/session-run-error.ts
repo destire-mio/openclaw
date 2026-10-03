@@ -1,7 +1,12 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
+import {
+  sliceUtf16Safe,
+  truncateUtf16Safe,
+  truncateWithMarker,
+} from "@openclaw/normalization-core/utf16-slice";
 import type { SessionRunStatus } from "../../packages/gateway-protocol/src/schema/sessions-row.js";
 import { renderUserFacingText } from "../agents/embedded-agent-helpers/user-facing-text.js";
+import { redactTranscriptText } from "../agents/transcript-redact-text.js";
 import {
   appendSessionTranscriptReport,
   type SessionTranscriptWriteScope,
@@ -13,6 +18,7 @@ import { redactSensitiveText } from "../logging/redact.js";
 import { STATE_CONTENTION_SUMMARY } from "./session-run-error-presentation.js";
 
 const SESSION_RUN_ERROR_MAX_CHARS = 160;
+const SESSION_TIMEOUT_PARTIAL_MAX_CHARS = 8_000;
 const RUN_FAILED_BEFORE_REPLY_TRANSCRIPT_TYPE = "run-failed-before-reply";
 
 function sanitizeSessionRunError(error: unknown): string {
@@ -37,13 +43,23 @@ export async function recordGatewaySessionRunFailure(
 ): Promise<void> {
   const { runId } = params;
   const error = truncateUtf16Safe(sanitizeSessionRunError(params.error), 512) || "unknown error";
+  // Redact the complete buffer before truncating so a boundary cannot split a secret
+  // before the transcript redactor sees it. Custom reports bypass message redaction.
+  const timeoutPartialText =
+    params.status === "timeout" && params.timeoutPartialText?.trim()
+      ? truncateWithMarker(
+          redactTranscriptText(params.timeoutPartialText),
+          SESSION_TIMEOUT_PARTIAL_MAX_CHARS,
+          { marker: "\n[truncated]", reserve: "\n[truncated]".length, trimEnd: false },
+        )
+      : undefined;
   // One existing custom report keeps the partial and its outcome inseparable.
   // Older readers already replay this format; partial text remains quoted data,
   // rather than an injected assistant message that they would filter out.
   const timeoutContent =
     "This turn timed out and may have performed work before it stopped." +
-    (params.timeoutPartialText?.trim()
-      ? `\n\nUnfinished assistant output (recorded text, not a completion claim):\n${JSON.stringify(params.timeoutPartialText)}`
+    (timeoutPartialText
+      ? `\n\nUnfinished assistant output (recorded text, not a completion claim):\n${JSON.stringify(timeoutPartialText)}`
       : "");
   const append = params.settleStartupSession
     ? appendSessionTranscriptReportNative

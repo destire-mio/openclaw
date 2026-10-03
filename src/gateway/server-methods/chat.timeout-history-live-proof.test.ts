@@ -3,7 +3,11 @@ import { createServer, type ServerResponse } from "node:http";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { writeOpenAiResponsesText } from "../../../test/helpers/openai-responses-sse.js";
-import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../test/helpers/promise.js";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { clearConfigCache, clearRuntimeConfigSnapshot } from "../../config/config.js";
 import { loadTranscriptEvents } from "../../config/sessions/session-accessor.js";
@@ -31,17 +35,28 @@ vi.mock("../server-maintenance.js", async (importOriginal) => {
     startGatewayMaintenanceTimers: (...args: Parameters<typeof startGatewayMaintenanceTimers>) => {
       maintenance.params = args[0];
       const scheduler = args[0].scheduler;
-      const schedule = scheduler.schedule.bind(scheduler);
-      const scheduling = vi.spyOn(scheduler, "schedule").mockImplementation((job) => {
-        if (job.id === "maintenance:dedupe") {
-          maintenance.sweep = job.run;
-        }
-        return schedule(job);
+      const createScope = scheduler.scope.bind(scheduler);
+      const schedulingSpies: Array<{ mockRestore: () => void }> = [];
+      const scoping = vi.spyOn(scheduler, "scope").mockImplementation(() => {
+        const scope = createScope();
+        const schedule = scope.schedule.bind(scope);
+        schedulingSpies.push(
+          vi.spyOn(scope, "schedule").mockImplementation((job) => {
+            if (job.id === "maintenance:dedupe") {
+              maintenance.sweep = job.run;
+            }
+            return schedule(job);
+          }),
+        );
+        return scope;
       });
       try {
         return actual.startGatewayMaintenanceTimers(...args);
       } finally {
-        scheduling.mockRestore();
+        scoping.mockRestore();
+        for (const scheduling of schedulingSpies) {
+          scheduling.mockRestore();
+        }
       }
     },
   };
@@ -68,8 +83,8 @@ vi.mock("../../sessions/session-run-error.js", async (importOriginal) => {
     },
   };
 });
-vi.mock("./chat-send-pre-admission.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./chat-send-pre-admission.js")>();
+vi.mock("./chat-send-timeout-persistence.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./chat-send-timeout-persistence.js")>();
   return {
     ...actual,
     waitForChatSessionTimeoutPersistence: (
@@ -84,6 +99,7 @@ vi.mock("./chat-send-pre-admission.js", async (importOriginal) => {
 
 const NOTICE = "This turn timed out and may have performed work before it stopped.";
 const PARTIAL = "TIMEOUT_PROOF_PARTIAL_OUTPUT";
+const CREDENTIAL = "sk-" + "synthetic-timeout-live-credential-".repeat(3);
 const COMPLETE = "TIMEOUT_PROOF_COMPLETED_OUTPUT";
 const envKeys = [
   "HOME",
@@ -137,7 +153,7 @@ describe("deadline outcome real Gateway history proof", () => {
   it(
     "persists terminal facts and includes them in the next provider request",
     { timeout: 150_000 },
-    async () => {
+    async ({ signal }) => {
       const envSnapshot = captureEnv([...envKeys]);
       let providerServer: ReturnType<typeof createServer> | undefined;
       let gateway: Awaited<ReturnType<typeof startGatewayWithClient>> | undefined;
@@ -239,7 +255,7 @@ describe("deadline outcome real Gateway history proof", () => {
                   item_id: item.id,
                   output_index: 0,
                   content_index: 0,
-                  delta: PARTIAL,
+                  delta: `${PARTIAL}\napi_key=${CREDENTIAL}`,
                 },
               ]) {
                 response.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -274,7 +290,7 @@ describe("deadline outcome real Gateway history proof", () => {
                   [provider.modelRef]: { params: { transport: "sse", openaiWsWarmup: false } },
                 },
               },
-              entries: { main: { default: true } },
+              entries: { main: {} },
             },
             models: {
               mode: "replace",
@@ -384,15 +400,13 @@ describe("deadline outcome real Gateway history proof", () => {
             if (!terminalPersistence) {
               throw new Error("timeout report has no persistence owner");
             }
-            await withTestTimeout(
-              Promise.race([
+            await withinTest(
+              awaitGateBeforeSettlement(
                 reportReady.promise,
-                terminalPersistence.then(() => {
-                  throw new Error("timeout persistence settled without reaching its report gate");
-                }),
-              ]),
-              10_000,
-              "timeout persistence did not reach its report gate",
+                terminalPersistence,
+                "timeout persistence settled without reaching its report gate",
+              ),
+              signal,
             );
             reportGateReached = true;
             const transcriptBeforeCommit = await transcriptFor(sessionKey);
@@ -414,10 +428,13 @@ describe("deadline outcome real Gateway history proof", () => {
             // This callback is a scheduling barrier. The failure scenario below
             // proves the awaited dependency through the actual RPC result.
             void earlyContinued.catch(() => {});
-            const reached = await withTestTimeout(
-              Promise.race([timeoutWaitCalled.promise, earlyContinued.then(() => "accepted")]),
-              10_000,
-              "next turn did not call the timeout persistence wait",
+            const reached = await withinTest(
+              awaitGateBeforeSettlement(
+                timeoutWaitCalled.promise,
+                earlyContinued,
+                "next turn did not call the timeout persistence wait",
+              ),
+              signal,
             );
             expect(reached).toBe("wait-called");
             requestBeforeReportRelease = requests[earlyNextRequestStart]?.body;
@@ -437,20 +454,12 @@ describe("deadline outcome real Gateway history proof", () => {
             if (current === "persistence-failure-timeout") {
               const failure = new Error("timeout history proof report write failed");
               releaseReport.reject(failure);
-              await expect(
-                withTestTimeout(
-                  earlyContinued,
-                  10_000,
-                  "next turn did not receive the timeout report failure",
-                ),
-              ).rejects.toMatchObject({
+              await expect(withinTest(earlyContinued, signal)).rejects.toMatchObject({
                 name: "GatewayClientRequestError",
                 gatewayCode: "INVALID_REQUEST",
                 message: `Error: ${failure.message}`,
               });
-              await expect(
-                withTestTimeout(terminalPersistence, 10_000, "timeout report owner did not reject"),
-              ).rejects.toBe(failure);
+              await expect(withinTest(terminalPersistence, signal)).rejects.toBe(failure);
             } else {
               releaseReport.resolve();
             }
@@ -514,9 +523,11 @@ describe("deadline outcome real Gateway history proof", () => {
             const timeoutReport = reportRows(firstTranscript);
             expect.soft(JSON.stringify(timeoutReport)).toContain(PARTIAL);
             expect.soft(JSON.stringify(timeoutReport)).toContain(NOTICE);
+            expect.soft(JSON.stringify(firstTranscript)).not.toContain(CREDENTIAL);
+            expect.soft(JSON.stringify(firstHistory)).not.toContain(CREDENTIAL);
             expect.soft(timeoutReport).toEqual([
               expect.objectContaining({
-                content: expect.stringContaining(JSON.stringify(PARTIAL)),
+                content: expect.stringContaining(`\n"${PARTIAL}\\napi_key=`),
               }),
             ]);
             const entriesWithPartial = firstTranscript.filter((entry) =>
@@ -553,6 +564,7 @@ describe("deadline outcome real Gateway history proof", () => {
           }
           if (current === "partial-timeout") {
             expect.soft(modelInput.includes(PARTIAL)).toBe(true);
+            expect.soft(modelInput).not.toContain(CREDENTIAL);
           }
           if (current === "normal") {
             expect.soft(modelInput.includes(COMPLETE)).toBe(true);

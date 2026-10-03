@@ -1,5 +1,9 @@
 import { expect, it, vi, type MockInstance } from "vitest";
-import { createDeferred, withTestTimeout } from "../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../test/helpers/promise.js";
 import { prepareSystemAgentRunAdmission } from "../../agents/admitted-run-context.js";
 import {
   createAdmittedGatewayToolCallerIdentity,
@@ -53,9 +57,9 @@ const admissionScenarios = [
   "dashboard-internal",
 ] as const;
 
-it.each(admissionScenarios)(
+it.for(admissionScenarios)(
   "keeps prepared-session binding with its exact admission: %s",
-  async (scenario) => {
+  async (scenario, { signal }) => {
     const dashboard = scenario.startsWith("dashboard");
     const directDashboard = dashboard && scenario !== "dashboard-internal";
     const dashboardReadAllowed = directDashboard && scenario !== "dashboard-unattested";
@@ -267,10 +271,13 @@ it.each(admissionScenarios)(
           await vi.waitFor(() => expect(holdDispatch).toHaveBeenCalledOnce(), { timeout: 3_000 });
         }
         if (timeoutDuringAdmission) {
-          await withTestTimeout(
-            workAdmissionReached.promise,
-            3_000,
-            "send did not reach work admission",
+          await withinTest(
+            awaitGateBeforeSettlement(
+              workAdmissionReached.promise,
+              handling,
+              "send did not reach work admission",
+            ),
+            signal,
           );
           if (timeoutPersistenceFails) {
             // The timeout appeared after the first check. Its failure must

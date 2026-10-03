@@ -2,6 +2,8 @@ import {
   asOptionalObjectRecord,
   asOptionalRecord as transcriptEventRecord,
 } from "@openclaw/normalization-core/record-coerce";
+import { readNonBlankString } from "@openclaw/normalization-core/string-coerce";
+import { filterStringEntries } from "@openclaw/normalization-core/string-normalization";
 import { getReplyPayloadMetadata } from "../../auto-reply/reply-payload.js";
 import {
   loadTranscriptEventRowsAfterSeqSync,
@@ -113,12 +115,7 @@ function buildAssistantDisplayRewrite(params: {
     : undefined;
   const previousMedia = transcriptEventRecord(params.message.openclawDelivery)?.mediaUrls;
   const managedMediaUrls = previousDisplay
-    ? [
-        ...(Array.isArray(previousMedia)
-          ? previousMedia.filter((value): value is string => typeof value === "string")
-          : []),
-        ...(params.managedMediaUrls ?? []),
-      ]
+    ? [...filterStringEntries(previousMedia), ...(params.managedMediaUrls ?? [])]
     : params.managedMediaUrls;
   const prepared = applyAssistantDeliveryDirectives(
     {
@@ -210,8 +207,7 @@ export function assistantTranscriptScope(
 }
 
 function transcriptEventId(event: TranscriptEvent): string | undefined {
-  const id = transcriptEventRecord(event)?.id;
-  return typeof id === "string" && id.trim().length > 0 ? id : undefined;
+  return readNonBlankString(transcriptEventRecord(event)?.id);
 }
 
 function transcriptEventMessage(event: TranscriptEvent): Record<string, unknown> | undefined {
@@ -246,6 +242,7 @@ function findAssistantTranscriptMessageByTurnIndexAndMediaInEvents(
   params: {
     assistantMessageIndex: number;
     mediaUrls: readonly string[];
+    rejectedMediaCount: number;
   },
 ): { messageId: string; message: Record<string, unknown> } | null {
   const expectedMedia = new Set(
@@ -254,7 +251,7 @@ function findAssistantTranscriptMessageByTurnIndexAndMediaInEvents(
       .filter((value) => value.length > 0),
   );
   if (
-    expectedMedia.size === 0 ||
+    (expectedMedia.size === 0 && params.rejectedMediaCount === 0) ||
     !Number.isSafeInteger(params.assistantMessageIndex) ||
     params.assistantMessageIndex < 1
   ) {
@@ -268,14 +265,17 @@ function findAssistantTranscriptMessageByTurnIndexAndMediaInEvents(
   if (!found || !text) {
     return null;
   }
+  const parsed = splitMediaFromOutput(text);
   const actualMedia = new Set(
-    (splitMediaFromOutput(text).mediaUrls ?? [])
+    (parsed.mediaUrls ?? [])
       .map((value) => normalizeMediaReferenceForComparison(value))
       .filter((value) => value.length > 0),
   );
+  // A reply whose only directives were rejected is identified by their count.
   const exactMediaMatch =
     actualMedia.size === expectedMedia.size &&
-    [...expectedMedia].every((value) => actualMedia.has(value));
+    [...expectedMedia].every((value) => actualMedia.has(value)) &&
+    (parsed.rejectedMediaCount ?? 0) === params.rejectedMediaCount;
   return exactMediaMatch ? found : null;
 }
 
@@ -347,35 +347,21 @@ export async function appendAssistantTranscriptMessage(
     "config" | "now" | "transcriptPath"
   > &
     AssistantTranscriptScopeParams & {
-      sessionFile?: string;
       createIfMissing?: boolean;
       cfg?: OpenClawConfig;
     },
 ): Promise<GatewayInjectedTranscriptAppendResult> {
+  const { createIfMissing, cfg, ...append } = params;
   const scope = assistantTranscriptScope(params);
   if (!scope) {
     return { ok: false, error: "transcript identity not resolved" };
   }
-  if (!params.createIfMissing && !(await transcriptExists(scope))) {
+  if (!createIfMissing && !(await transcriptExists(scope))) {
     return { ok: false, error: "transcript not found" };
   }
   return appendInjectedAssistantMessageToTranscript({
-    expectedSessionId: params.expectedSessionId,
-    expectedLifecycleRevision: params.expectedLifecycleRevision,
-    sessionKey: params.sessionKey,
-    sessionId: params.sessionId,
-    storePath: params.storePath,
-    ...(params.agentId ? { agentId: params.agentId } : {}),
-    message: params.message,
-    label: params.label,
-    content: params.content,
-    idempotencyKey: params.idempotencyKey,
-    stopReason: params.stopReason,
-    abortMeta: params.abortMeta,
-    ttsSupplement: params.ttsSupplement,
-    ...(params.contextFreeCommand === true ? { contextFreeCommand: true } : {}),
-    config: params.cfg,
-    onMessageCommitted: params.onMessageCommitted,
+    ...append,
+    config: cfg,
   });
 }
 
@@ -567,9 +553,13 @@ export async function rewriteAssistantTranscriptMessageByTurnIndexAndMedia(param
   content: AssistantDisplayContentBlock[];
   expectedGeneration: string | null;
   mediaUrls: readonly string[];
+  rejectedMediaCount: number;
   scope: ResolvedAssistantTranscriptScope;
 }): Promise<{ generation: string; messageId: string } | null> {
-  if (params.content.length === 0 || params.mediaUrls.length === 0) {
+  if (
+    params.content.length === 0 ||
+    (params.mediaUrls.length === 0 && params.rejectedMediaCount === 0)
+  ) {
     return null;
   }
   const currentWatermark = readSessionTranscriptWatermark(params.scope);

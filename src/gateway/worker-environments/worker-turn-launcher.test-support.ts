@@ -1,9 +1,11 @@
 import path from "node:path";
+import { expectDefined } from "@openclaw/normalization-core/expect";
 import { vi } from "vitest";
 import {
   WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
   WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
 } from "../../../packages/gateway-protocol/src/schema/worker-admission.js";
+import { WORKER_GATEWAY_TOOLS_PROTOCOL_FEATURE } from "../../../packages/gateway-protocol/src/schema/worker-gateway-tool.js";
 import {
   createOperationalRunInstanceRef,
   prepareAgentRunAdmission,
@@ -107,7 +109,7 @@ export const reconcileUnchangedLocalWorkspace: WorkerTurnTunnelHandle["reconcile
     if (request.source.kind !== "local") {
       throw new Error("expected a local workspace source");
     }
-    request.source.journal.commit(MANIFEST_REF);
+    await request.source.journal.commit(MANIFEST_REF);
     return {
       manifestRef: MANIFEST_REF,
       changed: false,
@@ -118,11 +120,12 @@ export const reconcileUnchangedLocalWorkspace: WorkerTurnTunnelHandle["reconcile
     };
   };
 
-export function acknowledgeCompletedWorkerTurn(
+export async function acknowledgeCompletedWorkerTurn(
   claim: WorkerSessionTurnClaim,
-  transcriptLeafId: string,
-): SpawnResult {
-  createWorkerSessionPlacementGate(placements).updateAckCursors({
+  transcriptLeafId: string | undefined,
+): Promise<SpawnResult> {
+  const leafId = expectDefined(transcriptLeafId, "persisted worker transcript leaf");
+  await createWorkerSessionPlacementGate(placements).updateAckCursors({
     claim,
     transcriptSeq: 2,
     liveSeq: 1,
@@ -130,7 +133,7 @@ export function acknowledgeCompletedWorkerTurn(
   return {
     stdout: JSON.stringify({
       status: "completed",
-      transcriptLeafId,
+      transcriptLeafId: leafId,
       transcriptNextSeq: (placements.get(SESSION_ID)?.lastTranscriptAckCursor ?? 0) + 1,
     }),
     stderr: "",
@@ -178,7 +181,7 @@ export async function setupWorkerTurnLauncherTest(): Promise<void> {
     fallbackEntry: entry,
     skipMaintenance: true,
   });
-  SessionManager.open(sessionTarget);
+  await SessionManager.openAsync(sessionTarget);
   sessionFile = SESSION_KEY;
 }
 
@@ -208,7 +211,7 @@ export function setWorkerTurnAdmissionCleanup(cleanup: () => void): void {
 }
 
 export function abortWorkerTurnClaimWaitOnSignal(signal: AbortSignal) {
-  const waitForClaim = placements.waitForTurnClaimRelease.bind(placements);
+  const waitForClaim = placements.waitForTurnClaimRelease;
   vi.spyOn(placements, "waitForTurnClaimRelease").mockImplementation((sessionId, options) =>
     waitForClaim(sessionId, {
       ...options,
@@ -281,8 +284,8 @@ export function createWorkerSessionTurnPlacementProvider(
   });
 }
 
-export function openSessionManager(): SessionManager {
-  return SessionManager.open(sessionTarget);
+export async function openSessionManager(): Promise<SessionManager> {
+  return await SessionManager.openAsync(sessionTarget);
 }
 
 export function readWorkerTurnTranscriptStorageRows() {
@@ -318,7 +321,7 @@ export async function dispatchInitialWorkerPlacement(params: {
     },
     { to: "active", patch: { activeOwnerEpoch: OWNER_EPOCH } },
   ] as const) {
-    placement = params.placements.transition({
+    placement = await params.placements.transition({
       sessionId: params.identity.sessionId,
       from: placement.state,
       expectedGeneration: placement.generation,
@@ -362,19 +365,19 @@ export async function seedReclaimedPlacement() {
   if (active?.state !== "active") {
     throw new Error("expected active placement to reclaim");
   }
-  const draining = placements.startDrain({
+  const draining = await placements.startDrain({
     sessionId: SESSION_ID,
     environmentId: active.environmentId,
     ownerEpoch: active.activeOwnerEpoch,
     expectedGeneration: active.generation,
   });
-  const reconciling = placements.startReconcile({
+  const reconciling = await placements.startReconcile({
     sessionId: SESSION_ID,
     environmentId: active.environmentId,
     ownerEpoch: active.activeOwnerEpoch,
     expectedGeneration: draining.generation,
   });
-  const reclaimed = placements.transition({
+  const reclaimed = await placements.transition({
     sessionId: SESSION_ID,
     from: "reconciling",
     to: "reclaimed",
@@ -402,6 +405,7 @@ export function attachedEnvironment(): WorkerTurnEnvironmentRecord {
       protocolFeatures: [
         WORKER_EXECUTION_CONTEXT_PROTOCOL_FEATURE,
         WORKER_EXECUTION_AUTHORITY_PROTOCOL_FEATURE,
+        WORKER_GATEWAY_TOOLS_PROTOCOL_FEATURE,
       ],
       installKind: "bundle",
     },
