@@ -1,5 +1,5 @@
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import { assert, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterEach, assert, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createDeferred } from "../../test/helpers/promise.js";
 import { prepareSystemAgentRunAdmission } from "../agents/admitted-run-context.js";
 import {
@@ -17,6 +17,10 @@ import {
   createAgentLifecycleTerminalBackstop,
   resolveAgentLifecycleTerminalMetadata,
 } from "../auto-reply/reply/agent-lifecycle-terminal.js";
+import {
+  clearRuntimeConfigSnapshot,
+  setRuntimeConfigSnapshot,
+} from "../config/runtime-snapshot.js";
 import { runWithCliHistoryWriter } from "../config/sessions/cli-history-boundary.js";
 import {
   loadSessionEntry,
@@ -48,6 +52,8 @@ import { createAgentEventTestHarness } from "./server-chat.agent-events.test-har
 import { buildGatewaySessionSnapshot } from "./session-event-payload.js";
 import { createSessionLifecyclePersistenceOwner } from "./session-lifecycle-persistence-owner.js";
 import { persistGatewaySessionLifecycleEvent } from "./session-lifecycle-state.js";
+
+afterEach(() => clearRuntimeConfigSnapshot());
 
 const target = {
   agentId: "main",
@@ -149,6 +155,7 @@ async function reports() {
 describe("durable pre-reply run failure", () => {
   it("publishes and persists one incomplete-turn notice after the model stops without an answer", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       const assistant = buildEmbeddedRunnerAssistant({
         content: [{ type: "thinking", thinking: "Still deciding." }],
@@ -239,6 +246,7 @@ describe("durable pre-reply run failure", () => {
     "preserves the active turn when a queued follow-up ends with %s",
     async (stopReason) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         await seed();
         const before = structuredClone(loadSessionEntry(target));
         assert(before);
@@ -344,6 +352,7 @@ describe("durable pre-reply run failure", () => {
 
   it("records one child failure outside its requester's ended turn and retains it after the next run", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       const requester = await resolveSessionTranscriptRuntimeTarget({
         ...target,
@@ -393,6 +402,7 @@ describe("durable pre-reply run failure", () => {
 
   it("records provider authentication failures as operator copy, not raw provider text", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       const providerError =
         "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, request id: req_401";
@@ -415,6 +425,7 @@ describe("durable pre-reply run failure", () => {
     "uses the %s identity when deadline admission predates session preparation",
     async (owner) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         await seed();
         await patchSessionEntryCore(target, () => ({
           lifecycleRunId: owner === "newer-lifecycle" ? "newer-run" : undefined,
@@ -459,6 +470,7 @@ describe("durable pre-reply run failure", () => {
     "retains one timeout outcome with %s output",
     async (partial) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         await seed(partial === "persisted" ? "partial" : undefined);
         const timeoutPartialText =
           partial === "buffered"
@@ -543,6 +555,7 @@ describe("durable pre-reply run failure", () => {
   ])("redacts and bounds $name before timeout storage and replay", async ({ partial }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async ({ writeConfig }) => {
       await writeConfig({ logging: { redactPatterns: ["/internal-\\d+/g"] } });
+      setRuntimeConfigSnapshot({ logging: { redactPatterns: ["/internal-\\d+/g"] } });
       await seed();
       await persistGatewaySessionLifecycleEvent({
         ...target,
@@ -588,6 +601,7 @@ describe("durable pre-reply run failure", () => {
 
   it("writes neither timeout notice nor buffered output after queued report authority expires", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed("partial");
       const before = await loadTranscriptEvents(target);
       const reportTarget = await resolveSessionTranscriptRuntimeTarget(target);
@@ -625,12 +639,14 @@ describe("durable pre-reply run failure", () => {
   });
 
   it.each(["active", "inactive", "other-run", "commentary", "success"] as const)(
-    "checks assistant output on the %s branch for this run",
+    "persists one terminal receipt despite assistant output on the %s branch",
     async (branch) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         await seed(branch);
         await persistGatewaySessionLifecycleEvent({ ...target, event });
-        expect(await reports()).toHaveLength(branch === "active" ? 0 : 1);
+        await persistGatewaySessionLifecycleEvent({ ...target, event });
+        expect(await reports()).toMatchObject([{ details: { runId, error } }]);
       });
     },
   );
@@ -649,6 +665,7 @@ describe("durable pre-reply run failure", () => {
     "records a run-timeout kill delivered as an aborted $phase event",
     async ({ phase, error: timeoutError, reason, ...timeoutFields }) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         await seed();
         await persistGatewaySessionLifecycleEvent({
           ...target,
@@ -686,6 +703,7 @@ describe("durable pre-reply run failure", () => {
     { phase: "completed" },
   ])("does not report $phase / $stopReason", async (data) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       await persistGatewaySessionLifecycleEvent({ ...target, event: { ...event, data } });
       expect(await reports()).toEqual([]);
@@ -694,6 +712,7 @@ describe("durable pre-reply run failure", () => {
 
   it("sanitizes and bounds the stored error", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       const secret = [
         String.fromCharCode(115, 107),
@@ -745,6 +764,7 @@ describe("durable pre-reply run failure", () => {
     },
   ])("retains the terminal cause of a bounded $name", async ({ prefix, context }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       const cause = "Cloud workspace reconciliation exceeds the 25000 entry limit.";
       await persistGatewaySessionLifecycleEvent({
@@ -762,6 +782,7 @@ describe("durable pre-reply run failure", () => {
 
   it.each(["session", "run"])("does not report a stale %s error", async (stale) => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       await persistGatewaySessionLifecycleEvent({
         ...target,
@@ -780,6 +801,7 @@ describe("durable pre-reply run failure", () => {
     "rejects authority revoked %s the lifecycle commit",
     async (when) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         await seed();
         let current = when === "after";
         onTestFinished(
@@ -808,6 +830,7 @@ describe("durable pre-reply run failure", () => {
 
   it("refuses a receipt after another writer claims the accepted terminal's session", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       await seed();
       let replacement: Promise<unknown> | undefined;
       const unsubscribe = sessionChanges.subscribe((change) => {
@@ -923,6 +946,7 @@ describe("CLI history through Gateway terminal persistence", () => {
     "retains same-account context after %s outside the CLI stack",
     async (phase) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         const f = await createCliHistoryFixture();
         try {
           await f.persist(phase);
@@ -948,6 +972,7 @@ describe("CLI history through Gateway terminal persistence", () => {
 
   it("keeps normal completion pending until its accepted write finishes", async () => {
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       const f = await createCliHistoryFixture();
       const release = createDeferred();
       const pending = release.promise.then(() => f.persist("end"));
@@ -971,6 +996,7 @@ describe("CLI history through Gateway terminal persistence", () => {
     "rejects a captured writer after %s without changing history",
     async (revoke) => {
       await withOpenClawTestState({ scenario: "minimal" }, async () => {
+        setRuntimeConfigSnapshot({});
         const f = await createCliHistoryFixture();
         const before = await loadTranscriptEvents(f.cliTarget);
         const pending = f.persist("end");

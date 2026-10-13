@@ -16,9 +16,12 @@ import { createMessageTool } from "../../agents/tools/message-tool-execution.js"
 import * as dispatch from "../../auto-reply/dispatch.js";
 import { mintReplyMessageActionTurnCapability } from "../../auto-reply/reply/agent-runner-utils.js";
 import { createReplyOperation } from "../../auto-reply/reply/reply-run-registry.js";
-import { getRuntimeConfig, setRuntimeConfigSnapshot } from "../../config/config.js";
+import { getRuntimeConfig } from "../../config/config.js";
+import { setRuntimeConfigSnapshot } from "../../config/runtime-snapshot.js";
 import {
+  commitReplySessionInitialization,
   loadExactSessionEntryReadOnly,
+  loadReplySessionInitializationSnapshot,
   loadTranscriptEvents,
   upsertSessionEntryCore,
 } from "../../config/sessions/session-accessor.js";
@@ -47,7 +50,7 @@ import {
 } from "../message-action-turn-capability.js";
 import { createChatRunState } from "../server-chat-state.js";
 import { handleGatewayRequest } from "../server-methods.js";
-import { resolveSessionMutationAuthorization } from "../session-sharing.js";
+import { resolveSessionMutationAuthorizationAsync } from "../session-sharing-authorization-async.js";
 import * as chatDispatch from "./chat-send-agent-dispatch.js";
 import { handleDirectExternalChatSend } from "./chat-send-external-entry.js";
 import { handleChatSend } from "./chat-send-handler.js";
@@ -82,6 +85,7 @@ it.for(admissionScenarios)(
     const directDashboard = dashboard && scenario !== "dashboard-internal";
     const dashboardReadAllowed = directDashboard && scenario !== "dashboard-unattested";
     const membershipRequired = scenario === "dashboard-member-revoked";
+    const createsDashboardSession = dashboardReadAllowed && !membershipRequired;
     const closure =
       scenario === "narrow-first-send"
         ? "rotated"
@@ -91,6 +95,7 @@ it.for(admissionScenarios)(
             ? "released"
             : scenario;
     await withOpenClawTestState({ scenario: "minimal" }, async () => {
+      setRuntimeConfigSnapshot({});
       const runId = "retained-preparation";
       const timeoutDuringAdmission = closure.startsWith("timeout-during-work-admission");
       const timeoutPersistenceFails = closure === "timeout-during-work-admission-fails";
@@ -247,6 +252,7 @@ it.for(admissionScenarios)(
       let reply: ReturnType<typeof createReplyOperation> | undefined;
       let successor: ReturnType<typeof registerChatAbortController> | undefined;
       let options: DispatchOptions | undefined;
+      let releaseAuthorization: (() => void) | undefined;
       try {
         const respond = vi.fn();
         const params = {
@@ -256,12 +262,13 @@ it.for(admissionScenarios)(
           idempotencyKey: runId,
           ...(foreignGlobalTimeout ? { agentId: "main" } : {}),
         };
-        const authorization = resolveSessionMutationAuthorization({
+        const authorization = await resolveSessionMutationAuthorizationAsync({
           client,
           context,
           method: "chat.send",
           requestParams: params,
         });
+        releaseAuthorization = authorization.authorization?.release;
         expect(authorization.error).toBeNull();
         const sendChat = directDashboard ? handleDirectExternalChatSend : handleChatSend;
         const request = {
@@ -368,13 +375,33 @@ it.for(admissionScenarios)(
         const { admission, userTurn } = owned;
         const original = admission.activeRunAbort.entry;
         expect(original?.sessionId).toBe(initialSessionId);
-        // This focused test controls preparation; the native WS test proves its real producer.
-        await upsertSessionEntryCore(scope, {
-          sessionId: membershipRequired ? initialSessionId : "committed-session",
+        const preparedEntry = {
+          sessionId: dashboard ? initialSessionId : "committed-session",
           updatedAt: Date.now(),
           createdActor,
           ...(membershipRequired ? { visibility: "suggest" as const } : {}),
-        });
+        };
+        if (createsDashboardSession) {
+          const creationScope = { ...scope, storePath: owned.session.storePath };
+          const snapshot = await loadReplySessionInitializationSnapshot(creationScope);
+          const bindCreation = options.replyOptions?.bindSessionCreation;
+          const onCreated = options.replyOptions?.onSessionCreated;
+          if (!bindCreation || !onCreated) {
+            throw new Error("chat.send did not hand off its session creation owner");
+          }
+          const result = await commitReplySessionInitialization({
+            ...creationScope,
+            activeSessionKey: sessionKey,
+            expectedRevision: snapshot.revision,
+            sessionEntry: preparedEntry,
+            bindCreation,
+            onCreated,
+          });
+          expect(result.ok).toBe(true);
+        } else {
+          // Replacement scenarios control preparation independently of creation.
+          await upsertSessionEntryCore(scope, preparedEntry);
+        }
         const committed = loadExactSessionEntryReadOnly(scope);
         if (!committed) {
           throw new Error("session writer did not commit");
@@ -522,6 +549,7 @@ it.for(admissionScenarios)(
           holdDispatch.mockRestore();
           observeDispatch.mockRestore();
           clone.mockRestore();
+          releaseAuthorization?.();
         }
       }
     });
@@ -538,6 +566,7 @@ it.each(
   "keeps authenticated $mode prompt reactions scoped through SQLite ($outcome)",
   async ({ mode, outcome }) => {
     await withOpenClawTestState({ scenario: "minimal" }, async (state) => {
+      setRuntimeConfigSnapshot({});
       const sessionKey = "agent:main:reaction-source";
       const sessionId = "reaction-source-session";
       const scope = { agentId: "main", sessionKey, sessionId };
@@ -615,6 +644,7 @@ it.each(
       );
       let token: string | undefined;
       let probe: ReturnType<typeof sqliteWorkerOwnerProbe.admission> | undefined;
+      const authorizationReleases: Array<() => void> = [];
       async function sendPrompt(runId: string, message: string) {
         const source: Source = {
           entered: createDeferred<DispatchOptions>(),
@@ -623,12 +653,15 @@ it.each(
         };
         sources.set(runId, source);
         const params = { sessionKey, message, idempotencyKey: runId };
-        const authorization = resolveSessionMutationAuthorization({
+        const authorization = await resolveSessionMutationAuthorizationAsync({
           client,
           context,
           method: "chat.send",
           requestParams: params,
         });
+        if (authorization.authorization?.release) {
+          authorizationReleases.push(authorization.authorization.release);
+        }
         expect(authorization.error).toBeNull();
         const respond = vi.fn();
         await handleDirectExternalChatSend({
@@ -868,6 +901,9 @@ it.each(
           if (source.owned) {
             clearAgentRunContext(runId, source.owned.admission.lifecycleGeneration);
           }
+        }
+        for (const release of authorizationReleases) {
+          release();
         }
         holdDispatch.mockRestore();
         observeDispatch.mockRestore();

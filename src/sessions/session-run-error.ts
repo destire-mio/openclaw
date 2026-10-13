@@ -6,6 +6,10 @@ import {
 } from "@openclaw/normalization-core/utf16-slice";
 import type { SessionRunStatus } from "../../packages/gateway-protocol/src/schema/sessions-row.js";
 import { renderUserFacingText } from "../agents/embedded-agent-helpers/user-facing-text.js";
+import {
+  renderAssistantRequestFailureCopy,
+  renderStorageFailureSummary,
+} from "../agents/failover/assistant-request-failure-copy.js";
 import { renderCodexAppServerFailureCopy } from "../agents/failover/user-copy.js";
 import {
   appendSessionTranscriptReport,
@@ -14,6 +18,7 @@ import {
 import type { CustomMessageReportAppend } from "../config/sessions/session-accessor.sqlite-transcript-reports.types.js";
 import type { SessionEntryCurrentCheck } from "../config/sessions/session-entry-current.types.js";
 import { withSessionTranscriptWriteAssertion } from "../config/sessions/transcript-write-context.js";
+import { classifyGatewayStorageFailure } from "../infra/sqlite-error-diagnostics.js";
 import { redactSensitiveText, redactToolPayloadText } from "../logging/redact.js";
 import { STATE_CONTENTION_SUMMARY } from "./session-run-error-presentation.js";
 
@@ -41,6 +46,7 @@ export async function recordGatewaySessionRunFailure(
   params: GatewaySessionRunFailure,
 ): Promise<void> {
   const { runId } = params;
+  const storageFailure = classifyGatewayStorageFailure(params.error);
   const error = truncateUtf16Safe(sanitizeSessionRunError(params.error), 512) || "unknown error";
   // Redact the complete buffer before truncating so a boundary cannot split a secret
   // before diagnostic redaction sees it. The report keeps its explicit masking boundary.
@@ -67,7 +73,8 @@ export async function recordGatewaySessionRunFailure(
         ? timeoutContent
         : params.errorKind === "state_contention"
           ? STATE_CONTENTION_SUMMARY
-          : (renderCodexAppServerFailureCopy(error) ??
+          : (renderAssistantRequestFailureCopy({ storageFailure }) ??
+            renderCodexAppServerFailureCopy(error) ??
             `Your request couldn't be completed: ${error}`),
     display: true,
     details: { runId, error, ...(params.errorKind ? { errorKind: params.errorKind } : {}) },
@@ -81,8 +88,6 @@ export async function recordGatewaySessionRunFailure(
         {
           kind: "custom",
           customTypes: [RUN_FAILED_BEFORE_REPLY_TRANSCRIPT_TYPE],
-          // Partial output does not establish a completed turn. Keep its timeout outcome visible.
-          suppressWhenAssistantRun: params.status === "timeout" ? undefined : runId,
           selectReport: (latest) => {
             params.assertCommitAllowed?.();
             return isRecord(latest?.details) && latest.details.runId === runId ? undefined : report;
@@ -110,7 +115,9 @@ export function resolveSessionRunError(
   if (outcome.errorKind === "state_contention") {
     return STATE_CONTENTION_SUMMARY;
   }
-  const error = sanitizeSessionRunError(outcome.error);
+  const error =
+    renderStorageFailureSummary(classifyGatewayStorageFailure(outcome.error)) ??
+    sanitizeSessionRunError(outcome.error);
   if (error.length <= SESSION_RUN_ERROR_MAX_CHARS) {
     return error || undefined;
   }
