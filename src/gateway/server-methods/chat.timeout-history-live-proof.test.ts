@@ -459,10 +459,13 @@ describe("deadline outcome real Gateway history proof", () => {
             expect.soft(JSON.stringify(transcriptBeforeCommit)).not.toContain(PARTIAL);
             expect.soft(JSON.stringify(transcriptBeforeCommit)).not.toContain(NOTICE);
             expect(reportRows(transcriptBeforeCommit)).toHaveLength(0);
+            // Later terminal events may replace the tracked promise while the
+            // lifecycle owner queues their writes behind this held report.
+            // Assert the retained dependency, then prove ordering through RPC.
             expect(
               maintenance.params?.chatAbortControllers.get(started.runId)
                 ?.projectSessionTerminalPersistence,
-            ).toBe(terminalPersistence);
+            ).toBeInstanceOf(Promise);
             nextTurn = true;
             earlyNextRequestStart = requests.length;
             earlyContinued = gateway.client.request<{ runId: string }>("chat.send", {
