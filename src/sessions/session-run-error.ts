@@ -7,7 +7,6 @@ import {
 import type { SessionRunStatus } from "../../packages/gateway-protocol/src/schema/sessions-row.js";
 import { renderUserFacingText } from "../agents/embedded-agent-helpers/user-facing-text.js";
 import { renderCodexAppServerFailureCopy } from "../agents/failover/user-copy.js";
-import { redactTranscriptText } from "../agents/transcript-redact-text.js";
 import {
   appendSessionTranscriptReport,
   type SessionTranscriptWriteScope,
@@ -15,7 +14,7 @@ import {
 import type { CustomMessageReportAppend } from "../config/sessions/session-accessor.sqlite-transcript-reports.types.js";
 import type { SessionEntryCurrentCheck } from "../config/sessions/session-entry-current.types.js";
 import { withSessionTranscriptWriteAssertion } from "../config/sessions/transcript-write-context.js";
-import { redactSensitiveText } from "../logging/redact.js";
+import { redactSensitiveText, redactToolPayloadText } from "../logging/redact.js";
 import { STATE_CONTENTION_SUMMARY } from "./session-run-error-presentation.js";
 
 const SESSION_RUN_ERROR_MAX_CHARS = 160;
@@ -44,11 +43,11 @@ export async function recordGatewaySessionRunFailure(
   const { runId } = params;
   const error = truncateUtf16Safe(sanitizeSessionRunError(params.error), 512) || "unknown error";
   // Redact the complete buffer before truncating so a boundary cannot split a secret
-  // before the transcript redactor sees it. Custom reports bypass message redaction.
+  // before diagnostic redaction sees it. The report keeps its explicit masking boundary.
   const timeoutPartialText =
     params.status === "timeout" && params.timeoutPartialText?.trim()
       ? truncateWithMarker(
-          redactTranscriptText(params.timeoutPartialText),
+          redactToolPayloadText(params.timeoutPartialText),
           SESSION_TIMEOUT_PARTIAL_MAX_CHARS,
           { marker: "\n[truncated]", reserve: "\n[truncated]".length, trimEnd: false },
         )
